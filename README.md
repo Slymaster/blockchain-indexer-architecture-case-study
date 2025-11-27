@@ -26,22 +26,22 @@ The architecture is decoupled into distinct services to ensure independent scali
 ```mermaid
 graph TD
     subgraph Upstream
-        A[Blockchain Nodes (RPC/WS)]
+        A["Blockchain Nodes (RPC/WS)"]
     end
 
     subgraph Indexer Platform
-        B(Ingestion Service<br><i>I/O Intensive</i>)
-        C{Apache Kafka<br><i>Raw Block Topic</i>}
-        D(Processing Service<br><i>CPU/DB Intensive</i>)
+        B("Ingestion Service<br>I/O Intensive")
+        C{"Apache Kafka<br>Raw Block Topic"}
+        D("Processing Service<br>CPU/DB Intensive")
     end
 
     subgraph Persistence
-        E[(TimescaleDB - OHLCV/Trades)]
-        F[(Redis - Chain State Cache)]
+        E[("TimescaleDB - OHLCV/Trades")]
+        F[("Redis - Chain State Cache")]
     end
 
     subgraph Downstream
-        G(API Gateway/HFT Systems)
+        G("API Gateway/HFT Systems")
     end
 
     A -- New Block Events --> B

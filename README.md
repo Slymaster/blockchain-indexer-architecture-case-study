@@ -1,204 +1,175 @@
-# High-Throughput Blockchain Indexer (HTBI)
+# Reliable Blockchain Indexer — Architecture Case Study
 
-## Architectural Reference & Disclaimer
+## Scope and evidence level
 
-This repository serves as an **architectural blueprint** and **system design demonstration** for a high-throughput, low-latency blockchain indexer tailored for financial applications (specifically HFT/DEX environments like Paradex).
+This repository is a **documentation-only architecture case study** for an EVM/L2 blockchain indexer. It discusses design choices for low-latency ingestion, chain reorganizations, Kafka ordering, idempotent persistence, and recovery.
 
-> ⚠️ **Note:** Due to strict Non-Disclosure Agreements (NDAs), the source code cannot be made public. This document details the design choices, trade-offs, data consistency models, and strategies for handling the complexities of real-time blockchain data ingestion, focusing on concurrency, data integrity, and resilience against chain reorganizations (Reorgs).
+It does **not** contain a public implementation, deployment, benchmark, or production configuration. The design is a conceptual reconstruction informed by professional experience on private and confidentiality-constrained systems; it does not disclose proprietary source code or client-specific details.
 
----
+The goal is to make the guarantees, failure modes, and trade-offs reviewable without overstating what this public repository proves.
 
-## 1. System Overview
+## 1. Problem statement
 
-The High-Throughput Blockchain Indexer (HTBI) is a **distributed, event-driven system** designed to ingest, parse, and store EVM/L2 blockchain data (Blocks, Transactions, Event Logs) in real-time. The primary objective is to provide **sub-second latency** access to derived financial data (e.g., OHLCV candles, liquidity states, trade events) while maintaining **strict data integrity**.
+An indexer ingests blocks, transactions, and event logs, then derives queryable data such as trades, balances, or time-series aggregates. The difficult part is not parsing the happy path. It is remaining correct when:
 
-The architecture is decoupled into distinct services to ensure independent scaling and fault tolerance:
+- a node changes its view of the canonical chain;
+- messages are delivered more than once;
+- a consumer crashes between a database commit and an offset commit;
+- ingestion and processing progress at different speeds;
+- a deployment changes event or database schemas;
+- downstream state must be rebuilt from retained events.
 
-| Service | Technology | Responsibility |
-|---------|------------|----------------|
-| **Ingestion Service** | Java 21/Loom | Manages persistent connections (WebSocket and RPC) to multiple blockchain nodes. Performs initial block validation, detects potential reorgs, and publishes raw, serialized block data to Kafka. |
-| **Processing Service** | Java 21/Spring Boot | Consumes raw data from Kafka, decodes transactions (using Web3j/ABI specifications), applies business logic (e.g., calculating trade prices, aggregating OHLCV), and persists the structured data. |
-| **Data Storage** | TimescaleDB/PostgreSQL | A time-series optimized relational database used for storing high-frequency trade data, facilitating efficient range queries and aggregations. |
-| **State Cache** | Redis | Used for maintaining the current chain state (latest block hash/height) for rapid validation during ingestion. |
+This case study favors low-latency, optimistic processing. Applications that cannot tolerate temporary exposure to non-final data should wait for chain-specific finality instead.
 
-### 1.1. Data Flow Diagram
+## 2. Conceptual architecture
+
+| Component | Illustrative technology | Responsibility |
+| --- | --- | --- |
+| Ingestion and chain tracker | Java 21 | Reads RPC/WebSocket sources, validates parent links, owns the accepted chain head, and emits ordered chain events. |
+| Ordered event log | Apache Kafka | Retains accepted blocks and rollback control events in per-chain order. |
+| Processing service | Spring Boot | Decodes data, applies domain logic, and persists idempotent projections. |
+| System of record | PostgreSQL / TimescaleDB | Stores projections, processed-event identifiers, and persisted processing progress. |
+| Derived cache | Redis | Serves rebuildable read state; it is not the authority for canonical-chain decisions. |
 
 ```mermaid
-graph TD
-    subgraph Upstream
-        A["Blockchain Nodes (RPC/WS)"]
-    end
-
-    subgraph Indexer Platform
-        B("Ingestion Service<br>I/O Intensive")
-        C{"Apache Kafka<br>Raw Block Topic"}
-        D("Processing Service<br>CPU/DB Intensive")
-    end
-
-    subgraph Persistence
-        E[("TimescaleDB - OHLCV/Trades")]
-        F[("Redis - Chain State Cache")]
-    end
-
-    subgraph Downstream
-        G("API Gateway/HFT Systems")
-    end
-
-    A -- New Block Events --> B
-    B -- Raw Data (Serialized) --> C
-    B -- Chain State Validation --> F
-    C -- Stream Consumption --> D
-    D -- Structured Data Inserts (Batched) --> E
-    D -. Updates .-> F
-    E -- Data Queries --> G
-    F -- Cached State --> G
-
-    style A fill:#ececff,stroke:#333,stroke-width:2px
-    style C fill:#d4e1f5,stroke:#333,stroke-width:2px
+flowchart LR
+    Nodes["Blockchain nodes (RPC / WebSocket)"] --> Ingest["Ingestion and chain tracker"]
+    Ingest -->|"BlockAccepted / ChainRollback keyed by chainId"| Kafka["Kafka ordered chain-event log"]
+    Kafka --> Processor["Processing service"]
+    Processor --> DB[("PostgreSQL / TimescaleDB")]
+    Processor --> Cache[("Redis derived cache")]
+    DB --> API["Query API / downstream consumers"]
+    Cache --> API
 ```
 
----
+### Authority boundaries
 
-## 2. The Reorg Challenge (Deep Chain Validation)
+The ingestion component owns its accepted canonical head. The processing component owns its persisted projection progress. These are deliberately separate concepts:
 
-In decentralized consensus systems, the tip of the chain is often **probabilistic**. Chain reorganizations (Reorgs) occur when a node switches its view of the canonical chain to a different fork (e.g., due to network latency or consensus attacks).
+- **accepted head:** the latest chain event accepted and emitted by ingestion;
+- **persisted head:** the latest chain event committed to the projection database;
+- **finalized head:** the latest block considered final according to chain-specific rules.
 
-> For a financial indexer, processing a block that is later orphaned leads to **corrupted data states** and **financial discrepancies**.
+Redis may cache these values for reads, but it must not become the sole source of truth for validation or recovery.
 
-### 2.1. Strategy: Optimistic Confirmation vs. Finality
+## 3. Ordering model
 
-| Strategy | Description | Trade-off |
-|----------|-------------|-----------|
-| **Waiting for Finality** | Waiting for sufficient block confirmations (6-12 blocks) or explicit finality gadgets (L2s) | Strong guarantees but introduces unacceptable latency for HFT environments |
-| **Optimistic Confirmation** | Processing blocks immediately upon detection | Minimal latency but requires robust, instantaneous reorg detection and handling |
+Kafka guarantees ordering only within a partition. The design therefore keys chain events by `chainId` and routes events for one chain through the same ordered partition or an equivalently fenced single-writer stream.
 
-**HTBI employs Optimistic Confirmation coupled with Real-time Deep Chain Validation.**
+The stream contains both data and control records:
 
-### 2.2. Reorg Handling Mechanism
+- `BlockAccepted`
+- `ChainRollback`
 
-1. **New Block Arrival:** The Ingestion Service receives Block N+1.
-2. **Parent Hash Check:** The system retrieves the hash of the previously indexed canonical Block N (from the Redis State Cache or DB).
-3. **Validation:** It compares `Block_N+1.parentHash` with `Block_N.hash`.
-   - **Match:** The chain is consistent. Block N+1 is published to Kafka.
-   - **Mismatch:** A Reorg is detected. The previously indexed Block N is now orphaned.
+Rollback records are not placed on a separate "high-priority" topic because Kafka provides no ordering guarantee across topics. Keeping control and block events in the same per-chain order prevents later blocks from overtaking a rollback instruction.
 
-**When a mismatch occurs:**
+This choice also defines a scaling limit: work for different chains can be parallelized, while state transitions for one chain remain sequential. Parallel processing within a block requires an additional aggregation barrier before the persisted head can advance.
 
-1. **Halt Forward Progress:** Pause processing of new blocks temporarily.
-2. **Signal Rollback:** A `ROLLBACK_EVENT` message is published to a dedicated, high-priority Kafka topic, indicating the last valid block height (the "common ancestor", e.g., N-1).
-3. **Invalidate State:** The Processing Service consumes the `ROLLBACK_EVENT`. It initiates a database transaction to delete all data derived from the orphaned blocks (Blocks N and potentially others if the reorg depth > 1).
-4. **Rewind & Reprocess:** The Ingestion Service fetches the new canonical fork (starting from the new Block N') and publishes it, allowing the system to converge to the correct state.
+## 4. Reorganization handling
 
-### 2.3. Reorg Sequence Diagram
+When a new block does not reference the currently accepted parent:
+
+1. ingestion stops advancing that chain's accepted head;
+2. it walks parent links to find a common ancestor within a configured maximum depth;
+3. it emits `ChainRollback(commonAncestor)` in the ordered chain stream;
+4. it emits the replacement canonical blocks after the rollback record;
+5. processing consumes the rollback before the replacement blocks;
+6. projection changes and the persisted head are rewound in a database transaction;
+7. derived cache entries are invalidated or rebuilt after the database commit.
 
 ```mermaid
 sequenceDiagram
-    participant Node as Blockchain Node
-    participant Ingest as Ingestion Service
-    participant Validator as Chain State (Cache/DB)
-    participant Kafka
-    participant Proc as Processing Service
-    participant DB as TimescaleDB
+    participant Node as Blockchain node
+    participant Ingest as Chain tracker
+    participant Kafka as Ordered chain stream
+    participant Proc as Processor
+    participant DB as PostgreSQL
 
-    Note over Ingest, Validator: Current Head: Block N (Hash A)
-    Node->>Ingest: New Block (N+1, ParentHash=Hash_A)
-    Ingest->>Validator: Validate Parent Hash_A
-    Validator-->>Ingest: OK
-
-    Ingest->>Kafka: Publish Block N+1
-    Kafka->>Proc: Consume Block N+1
-    Proc->>DB: Persist Data (N+1)
-    Proc->>Validator: Update Head to N+1
-
-    rect rgba(255, 0, 0, 0.1)
-    Note right of Node: Reorg Event
-    Node->>Ingest: New Block (N+1', ParentHash=Hash_A')
-    Ingest->>Validator: Validate Parent Hash_A' against Hash_A
-    Validator-->>Ingest: MISMATCH! Reorg Detected.
-
-    Ingest->>Ingest: Find Common Ancestor (e.g., N-1)
-    Ingest->>Kafka: Publish ROLLBACK_EVENT (Last Valid Block: N-1)
-
-    Kafka->>Proc: Consume ROLLBACK_EVENT
-    Proc->>DB: BEGIN TX
-    Note right of Proc: Invalidate Orphaned Data
-    Proc->>DB: DELETE FROM data WHERE block >= N
-    Proc->>DB: UPDATE indexer_state SET height = N-1
-    Proc->>DB: COMMIT TX
-    Proc->>Validator: Rewind Head to N-1
-
-    Ingest->>Node: Fetch New Canonical Chain (N', N+1')
-    Ingest->>Kafka: Publish Blocks N', N+1'
-    end
+    Node->>Ingest: Block N+1 with unexpected parent
+    Ingest->>Ingest: Find common ancestor N-1
+    Ingest->>Kafka: ChainRollback(N-1)
+    Ingest->>Kafka: BlockAccepted(N')
+    Ingest->>Kafka: BlockAccepted(N+1')
+    Kafka->>Proc: ChainRollback(N-1)
+    Proc->>DB: Rewind projections and persisted head (transaction)
+    Kafka->>Proc: Replacement blocks in order
+    Proc->>DB: Persist idempotent projections
 ```
 
----
+Production designs must additionally define maximum rollback depth, behavior when no ancestor is found, provider disagreement, finality rules, and how expensive derived aggregates are rebuilt.
 
-## 3. Key Architectural Decisions (Trade-offs)
+## 5. Delivery and database semantics
 
-### 3.1. Why Java 21 (Project Loom) over Node.js/Go?
+This design assumes **at-least-once delivery with idempotent database effects**. It does not claim end-to-end exactly-once processing across Kafka and PostgreSQL.
 
-While Node.js excels at asynchronous I/O and Go offers lightweight concurrency via Goroutines, **Java 21** was selected for this critical financial infrastructure due to:
+Each consumed event has a stable identifier. A database transaction should atomically:
 
-| Factor | Rationale |
-|--------|-----------|
-| **Virtual Threads (Project Loom)** | Blockchain indexing is heavily I/O-bound (maintaining thousands of WebSocket connections, waiting for RPC responses, database acknowledgments). Virtual Threads allow us to adopt a simple, synchronous "thread-per-request" programming model without the overhead and scaling limitations of platform (OS) threads. This vastly simplifies concurrent code, making it easier to debug and maintain compared to complex reactive chains (WebFlux) or callback structures, while achieving massive scalability. |
-| **Strong Typing and Financial Integrity** | Java's strong, static type system minimizes the risk of runtime errors common in dynamically typed languages (like JavaScript/Python). This is critical when handling financial calculations, BigInteger precision (for Wei), and complex data structures where correctness is paramount. |
-| **Ecosystem Maturity and Performance** | The maturity of libraries like the Confluent Kafka Client, Web3j, and the Spring ecosystem provides robust tooling. Furthermore, modern JVMs with advanced Garbage Collectors (like ZGC) offer predictable low-pause times crucial for low-latency applications. |
+1. claim or insert the event identifier in an inbox table;
+2. apply the projection changes;
+3. update the persisted chain progress;
+4. commit.
 
-### 3.2. Why Apache Kafka over RabbitMQ?
+The Kafka offset is committed only after the database transaction succeeds. A crash after the database commit but before the offset commit causes redelivery; the inbox record makes that redelivery a no-op.
 
-The choice of the message broker is fundamental to the pipeline's reliability and flexibility. **Kafka** was chosen over traditional message queues like RabbitMQ for the following reasons:
+Example identifiers include:
 
-| Factor | Rationale |
-|--------|-----------|
-| **Replayability (Log-based Architecture)** | Kafka treats the data stream as an immutable, append-only log. Messages are retained based on configuration, not just consumption. This is essential. If we deploy a new version of the Processing Service with updated parsing logic or need to recover from a failure, we can simply replay the entire history of raw block data from Kafka to rebuild the database state deterministically. |
-| **Strict Ordering Guarantees** | Blockchain data MUST be processed sequentially. Kafka guarantees strict ordering of messages within a partition. By keying the Kafka messages appropriately, we ensure blocks are processed in the correct order, simplifying state management. |
-| **High Throughput and Scalability** | Kafka is designed for high-volume, persistent data streams and scales horizontally more effectively than RabbitMQ for this type of workload, handling potential backpressure gracefully. |
+```text
+(chainId, blockHash)
+(chainId, transactionHash, logIndex)
+```
 
----
+Block number alone is not sufficient because different forks can contain different blocks at the same height.
 
-## 4. Data Consistency & Reliability
+## 6. Replay and schema evolution
 
-Ensuring data integrity despite network failures, service restarts, and chain reorganizations is fundamental.
+Kafka retention can support projection rebuilds, but deterministic replay requires more than resetting offsets:
 
-### 4.1. Idempotency and Exactly-Once Semantics (EOS)
+- immutable, versioned event contracts;
+- retained decoder and ABI versions;
+- deterministic domain calculations;
+- migration rules for old event versions;
+- a separate consumer group or isolated rebuild environment;
+- reconciliation before switching read traffic to the rebuilt projection.
 
-We aim for effective **Exactly-Once Semantics (EOS)** to prevent duplicate data entries if a message is processed multiple times (e.g., due to a consumer failure before committing offsets).
+Replayability is therefore a design goal, not an automatic consequence of using Kafka.
 
-- **Deterministic Primary Keys:** We define primary keys based on immutable blockchain properties. For example, an event log entry is uniquely identified by `(ChainID, BlockNumber, TransactionHash, LogIndex)`.
+## 7. Performance considerations
 
-- **Idempotent Writes:** Database inserts use PostgreSQL's `INSERT ... ON CONFLICT DO NOTHING` (or `DO UPDATE` where appropriate). If the system attempts to insert the same data twice, the second attempt is safely ignored without corrupting the state.
+Potential tuning mechanisms include JDBC batching, bounded consumer batches, suitable TimescaleDB chunking, Kafka compression, and producer batching. Their values must be derived from measurements rather than copied into a reference configuration.
 
-### 4.2. Atomic Writes and State Management
+A credible benchmark would report:
 
-A critical consistency challenge is ensuring that the database state and the "Last Indexed Block" marker are updated **atomically**. If they diverge, the system may lose data or process duplicates upon restart.
+- dataset and block/event distribution;
+- hardware and JVM configuration;
+- producer and consumer configuration;
+- throughput and end-to-end latency at p50, p95, and p99;
+- consumer lag and database saturation;
+- recovery time after a consumer restart or rollback;
+- correctness checks performed after the run.
 
-**Solution:** We store the consumer progress marker (the last successfully indexed block height) within the TimescaleDB itself, in a dedicated `indexer_state` table. The business data (trades, events) and the progress marker are committed within the **same ACID transaction**. This guarantees that the stored data always reflects the recorded progress.
+No performance result is claimed by this repository today.
 
----
+## 8. Reliability and operational questions
 
-## 5. Performance Tuning
+The following concerns remain intentionally explicit rather than hidden behind a "production-ready" label:
 
-To meet the high-throughput and low-latency requirements, several optimizations are implemented:
+- How is a single active chain writer elected and fenced?
+- How are RPC providers compared when they disagree?
+- What is the maximum supported reorg depth?
+- How are poison events quarantined without breaking chain order?
+- How are event and database schemas migrated?
+- How are projections reconciled after replay?
+- Which metrics define ingestion delay, processing delay, and finality delay?
+- What recovery point and recovery time objectives are required?
 
-### 5.1. Database Optimization
+These questions should be answered by an implementation, automated failure tests, and operational runbooks before production claims are made.
 
-| Optimization | Description |
-|--------------|-------------|
-| **JDBC Batch Processing** | The Processing Service utilizes JDBC batch inserts (`executeBatch()`). Instead of inserting records one by one, we accumulate records (e.g., all events within a block) and insert them in a single database round trip. This significantly reduces transaction overhead and increases insertion throughput by orders of magnitude. |
-| **TimescaleDB Hypertables** | Utilizing Hypertables for time-series data ensures efficient partitioning (e.g., daily chunks), maintaining fast query performance on recent data. |
+## 9. Why Java and Kafka?
 
-### 5.2. Kafka Optimization
+Java offers a mature ecosystem for Kafka, PostgreSQL, observability, and strongly typed domain modelling. Java 21 virtual threads may simplify blocking I/O paths, but their suitability depends on the chosen clients, pinning behavior, and profiling results.
 
-| Configuration | Value | Rationale |
-|---------------|-------|-----------|
-| **Producer Batching (`linger.ms`)** | 5-10ms | Set slightly above zero to allow the producer to accumulate messages into larger batches before sending, improving throughput and compression efficiency at the cost of minor latency. |
-| **Compression (`compression.type`)** | `lz4` or `zstd` | Compresses raw block data, reducing network bandwidth and storage requirements in Kafka. |
-| **Acknowledgements (`acks`)** | `all` | Ensures maximum durability, guaranteeing that data is replicated across multiple brokers before the write is considered successful. |
-
----
+Kafka is useful here because it provides a retained ordered log per partition and independent consumer groups. It does not by itself provide global ordering, priority delivery, database atomicity, or deterministic replay; those properties must be designed explicitly.
 
 ## License
 
-This architectural documentation is provided for educational and reference purposes only.
+This architectural documentation is available under the MIT License. Third-party products and technologies mentioned remain subject to their own licenses.
